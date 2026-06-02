@@ -1,7 +1,7 @@
 # PCIe Sub-NUMA Latency Harness
 
 Measures TX (CPU→NIC) and RX (NIC→CPU) DMA latency using DPDK hardware
-timestamps. Sweeps each PCIe slot across all SNC NUMA nodes to identify
+timestamps. Tests each PCIe slot across all SNC NUMA nodes to identify
 which slot + node combination gives lowest latency for a network device.
 
 ---

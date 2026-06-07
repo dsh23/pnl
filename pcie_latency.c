@@ -595,7 +595,7 @@ static void run_measurement(uint16_t tx_port, uint16_t rx_port)
             struct timespec ts = {0, 0};
             int tries = 1000;
             while (tries-- > 0) {
-                if (rte_eth_timesync_read_tx_timestamp(port_id, &ts) == 0) {
+                if (rte_eth_timesync_read_tx_timestamp(tx_port, &ts) == 0) {
                     hw_tx_time = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
                     break;
                 }

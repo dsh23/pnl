@@ -231,10 +231,36 @@ for dev in /sys/bus/pci/devices/*/; do
     class=$(cat "$dev/class" 2>/dev/null || echo "")
     if [[ "$class" == "0x020000" || "$class" == "0x020001" ]]; then
         node=$(cat "$dev/numa_node" 2>/dev/null || echo "?")
-        driver=$(cat "$dev/uevent" 2>/dev/null | grep DRIVER | cut -d= -f2 || echo "?")
-        printf "  %-16s  NUMA node: %2s  driver: %s\n" "$bdf" "$node" "$driver"
+
+        # Resolve current driver via the driver symlink - more reliable than
+        # uevent DRIVER= which is not set by all drivers (e.g. sfc)
+        if [[ -L "$dev/driver" ]]; then
+            driver=$(basename "$(readlink "$dev/driver")")
+        else
+            driver="(none/unbound)"
+        fi
+
+        # Identify vendor from PCI vendor id
+        vendor_id=$(cat "$dev/vendor" 2>/dev/null || echo "?")
+        device_id=$(cat "$dev/device" 2>/dev/null || echo "?")
+        if [[ "$vendor_id" == "0x1924" ]]; then
+            vendor_name="Solarflare"
+        elif [[ "$vendor_id" == "0x8086" ]]; then
+            vendor_name="Intel"
+        elif [[ "$vendor_id" == "0x15b3" ]]; then
+            vendor_name="Mellanox"
+        else
+            vendor_name="$vendor_id"
+        fi
+
+        printf "  %-16s  NUMA node: %2s  driver: %-16s  vendor: %s [%s]\n" \
+            "$bdf" "$node" "$driver" "$vendor_name" "$device_id"
     fi
 done
+log ""
+log "Note: devices showing driver 'sfc' or '(none/unbound)' need binding to"
+log "      vfio-pci before use. Devices already on vfio-pci are ready."
+log "      Bind with: sudo modprobe -r sfc && dpdk-devbind.py --bind=vfio-pci <BDF>"
 
 log ""
 log "System prepared. You can now run: ./run_test.sh"

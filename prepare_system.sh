@@ -30,15 +30,45 @@ printf '\x00\x00\x00\x00' >&9
 log "  /dev/cpu_dma_latency held at 0 (fd 9) for this shell session"
 
 ###############################################################################
-# 2. Disable TurboBoost (Intel)
+# 2. Disable CPU boost (vendor-aware)
+#
+# Three cases in order of preference:
+#   Intel:        /sys/devices/system/cpu/intel_pstate/no_turbo
+#   AMD Zen4+:    /sys/devices/system/cpu/amd_pstate/cpb_boost  (kernel >= 6.3)
+#                 driver modes: active (amd-pstate-epp) / guided (amd-pstate)
+#   AMD legacy:   /sys/devices/system/cpu/cpufreq/boost        (acpi-cpufreq)
+#                 write 0 to disable (inverted polarity vs Intel)
 ###############################################################################
 
-if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
-    echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
-    log "TurboBoost disabled"
-else
-    log "intel_pstate not found — skip turbo disable (AMD: use msr-tools)"
-fi
+disable_boost() {
+    # Intel pstate
+    if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+        echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+        log "Intel TurboBoost disabled (intel_pstate)"
+        return
+    fi
+
+    # AMD amd-pstate cpb_boost (Zen 4+ with kernel >= 6.3, all driver modes)
+    if [[ -f /sys/devices/system/cpu/amd_pstate/cpb_boost ]]; then
+        echo "disabled" > /sys/devices/system/cpu/amd_pstate/cpb_boost
+        log "AMD Precision Boost disabled (amd_pstate/cpb_boost)"
+        return
+    fi
+
+    # AMD acpi-cpufreq fallback (older kernels or amd_pstate=disable boot param)
+    if [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+        echo 0 > /sys/devices/system/cpu/cpufreq/boost
+        log "AMD Precision Boost disabled (cpufreq/boost)"
+        return
+    fi
+
+    log "WARNING: no boost control interface found — boost not disabled."
+    log "  Intel: add intel_iommu=on to kernel cmdline and reboot"
+    log "  AMD:   kernel >= 6.3 exposes amd_pstate/cpb_boost; older kernels"
+    log "         need amd_pstate=passive or amd_pstate=disable in cmdline"
+}
+
+disable_boost
 
 ###############################################################################
 # 3. Hugepages
@@ -148,11 +178,40 @@ log "  Example: isolcpus=4-7 nohz_full=4-7 rcu_nocbs=4-7"
 log "  Current: $(cat /proc/cmdline | grep -o 'isolcpus=[^ ]*' || echo 'not set')"
 
 ###############################################################################
-# 7. Show NUMA / SNC topology
+# 7. Show NUMA topology (Intel SNC / AMD NPS)
+#
+# Intel: Sub-NUMA Clustering (SNC2 / SNC4) — set in BIOS
+# AMD:   Nodes Per Socket  (NPS1 / NPS2 / NPS4) — set in BIOS
+#        Zen 4 (Genoa/EPYC 9004): NPS4 creates 4 NUMA domains per socket,
+#        each mapped to one IOD quadrant. PCIe devices are local to the NUMA
+#        domain whose IOD quadrant owns the root complex for that slot.
+#        Verify with: numactl --hardware (expect >= 2 nodes per socket for
+#        NPS2/NPS4, or >= 4 for NPS4)
 ###############################################################################
 
+detect_cpu_vendor() {
+    if grep -q "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        echo "amd"
+    elif grep -q "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
+        echo "intel"
+    else
+        echo "unknown"
+    fi
+}
+
+VENDOR=$(detect_cpu_vendor)
+
 log ""
-log "=== Topology ==="
+log "=== Topology (vendor: ${VENDOR}) ==="
+if [[ "$VENDOR" == "amd" ]]; then
+    log "AMD NPS mode — check BIOS: DF Common Options → Memory Addressing → NPS"
+    log "  NPS1 = 1 NUMA node/socket (default)"
+    log "  NPS2 = 2 NUMA nodes/socket"
+    log "  NPS4 = 4 NUMA nodes/socket (each IOD quadrant = 1 domain)"
+    log "  PCIe device locality follows its IOD quadrant's NUMA domain"
+elif [[ "$VENDOR" == "intel" ]]; then
+    log "Intel SNC mode — check BIOS: Memory → Sub-NUMA Clustering → SNC2/SNC4"
+fi
 numactl --hardware
 echo ""
 

@@ -37,7 +37,7 @@
 #include <rte_cycles.h>
 #include <rte_malloc.h>
 #include <rte_numa.h>
-#include <rte_pmd_ixgbe.h>   /* Intel 10G - adjust for your NIC */
+
 
 /* --------------------------------------------------------------------------
  * Configuration constants
@@ -114,20 +114,111 @@ static void sig_handler(int sig)
  * Topology validation
  * -------------------------------------------------------------------------- */
 
+/*
+ * Detect CPU vendor by reading /proc/cpuinfo.
+ * Returns 'A' for AMD, 'I' for Intel, '?' for unknown.
+ */
+static char detect_cpu_vendor(void)
+{
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (!f) return '?';
+
+    char line[128];
+    char vendor = '?';
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "vendor_id", 9) == 0) {
+            if (strstr(line, "AuthenticAMD"))      vendor = 'A';
+            else if (strstr(line, "GenuineIntel")) vendor = 'I';
+            break;
+        }
+    }
+    fclose(f);
+    return vendor;
+}
+
+/*
+ * Read the NPS mode from /sys for AMD Zen 4+ systems.
+ * Returns the number of NUMA nodes exposed per socket (1/2/4),
+ * or -1 if it cannot be determined.
+ *
+ * Under NPS4 each IOD quadrant is a separate NUMA domain and PCIe
+ * devices are local to the domain whose quadrant owns the root complex.
+ */
+static int amd_detect_nps(void)
+{
+    /* numactl exposes total nodes; derive NPS by dividing by socket count */
+    int total_nodes = 0;
+    int total_sockets = 0;
+
+    /* Count NUMA nodes */
+    FILE *f = fopen("/sys/devices/system/node/possible", "r");
+    if (f) {
+        int lo, hi;
+        if (fscanf(f, "%d-%d", &lo, &hi) == 2)
+            total_nodes = hi - lo + 1;
+        else if (fscanf(f, "%d", &lo) == 1)
+            total_nodes = 1;
+        fclose(f);
+    }
+
+    /* Count physical sockets */
+    f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[128];
+        int max_pkg = -1;
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "physical id", 11) == 0) {
+                int id;
+                if (sscanf(line, "physical id : %d", &id) == 1 && id > max_pkg)
+                    max_pkg = id;
+            }
+        }
+        fclose(f);
+        if (max_pkg >= 0) total_sockets = max_pkg + 1;
+    }
+
+    if (total_sockets > 0 && total_nodes > 0)
+        return total_nodes / total_sockets;
+    return -1;
+}
+
 static void validate_topology(uint16_t port_id)
 {
-    int nic_node = rte_eth_dev_socket_id(port_id);
+    int nic_node  = rte_eth_dev_socket_id(port_id);
     int core_node = rte_socket_id();
+    char vendor   = detect_cpu_vendor();
 
     printf("\n[Topology]\n");
+    printf("  CPU vendor     : %s\n",
+           vendor == 'A' ? "AMD" : vendor == 'I' ? "Intel" : "Unknown");
     printf("  NIC NUMA node  : %d\n", nic_node);
     printf("  Core NUMA node : %d\n", core_node);
 
+    /* AMD-specific: report NPS mode and IOD quadrant locality context */
+    if (vendor == 'A') {
+        int nps = amd_detect_nps();
+        if (nps > 0) {
+            printf("  AMD NPS mode   : NPS%d (%d NUMA node%s per socket)\n",
+                   nps, nps, nps > 1 ? "s" : "");
+            if (nps >= 2) {
+                printf("  Note           : Under NPS%d each IOD quadrant is a "
+                       "separate NUMA domain.\n"
+                       "                   PCIe device locality is determined by "
+                       "which quadrant owns\n"
+                       "                   the root complex for that slot. Check "
+                       "/sys/bus/pci/devices/<bdf>/numa_node\n", nps);
+            }
+        } else {
+            printf("  AMD NPS mode   : could not determine (check numactl --hardware)\n");
+        }
+    }
+
+    /* Validate expected node from -s flag (Intel SNC node / AMD NPS domain) */
     if (g_cfg.snc_node >= 0) {
         printf("  Expected node  : %d\n", g_cfg.snc_node);
         if (core_node != g_cfg.snc_node) {
             fprintf(stderr,
-                "WARN: core is on node %d but expected SNC node %d. "
+                "WARN: core is on node %d but expected node %d. "
                 "Re-run with numactl --cpunodebind=%d --membind=%d\n",
                 core_node, g_cfg.snc_node,
                 g_cfg.snc_node, g_cfg.snc_node);
@@ -136,9 +227,10 @@ static void validate_topology(uint16_t port_id)
 
     if (nic_node != core_node) {
         fprintf(stderr,
-            "WARN: NIC is on node %d but core is on node %d. "
-            "Cross-SNC path — results will reflect remote root complex latency.\n",
-            nic_node, core_node);
+            "WARN: NIC is on NUMA node %d but core is on node %d. "
+            "Cross-%s path — results will reflect remote root complex latency.\n",
+            nic_node, core_node,
+            vendor == 'A' ? "NPS domain (IOD quadrant)" : "SNC domain");
     } else {
         printf("  Status         : LOCAL root complex (optimal)\n");
     }

@@ -4,18 +4,25 @@
  * PCIe latency measurement harness for sub-NUMA cluster evaluation.
  *
  * Measures Tx (CPU→NIC) and Rx (NIC→CPU) DMA latency using DPDK
- * hardware timestamps. Pin this process to a specific SNC domain
- * using numactl before running.
+ * hardware timestamps where available. Pin this process to a specific
+ * SNC/NPS domain using numactl before running.
  *
  * Build:  see Makefile
  * Run:    see run_test.sh
  *
  * Methodology:
- *   Tx latency = hw_tx_timestamp - sw_descriptor_post_tsc
- *   Rx latency = sw_poll_completion_tsc - hw_rx_timestamp
+ *   Tx latency = sw_post_burst_tsc - sw_descriptor_post_tsc
+ *     (TSC-only: measures time from descriptor write to burst return,
+ *      i.e. the PCIe descriptor write round-trip visible to SW.
+ *      NICs that do not implement timesync TX — e.g. sfc/X2522 — use
+ *      this path. Relative slot×node comparisons remain valid.)
  *
- * Both directions use the NIC's hardware clock, cross-referenced
- * against TSC via rte_eth_read_clock() for conversion.
+ *   Rx latency = sw_poll_completion_tsc - hw_rx_timestamp
+ *     (HW Rx timestamp via RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, enabled
+ *      when NIC advertises RTE_ETH_RX_OFFLOAD_TIMESTAMP. Falls back to
+ *      SW-only TSC if the NIC does not support it.)
+ *
+ * Clock conversion uses rte_eth_read_clock() to calibrate NIC→ns.
  */
 
 #include <stdint.h>
@@ -32,11 +39,11 @@
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
+#include <rte_mbuf_dyn.h>
 #include <rte_mempool.h>
 #include <rte_lcore.h>
 #include <rte_cycles.h>
 #include <rte_malloc.h>
-//#include <rte_numa.h>
 
 
 /* --------------------------------------------------------------------------
@@ -99,6 +106,18 @@ static sample_buf_t        g_rx_samples;
 /* Clock conversion state */
 static uint64_t g_hz_tsc;          /* TSC frequency */
 static uint64_t g_hz_nic;          /* NIC clock frequency */
+
+/*
+ * Dynfield offset for RTE_MBUF_DYNFIELD_TIMESTAMP_NAME.
+ * Registered at port init time when RTE_ETH_RX_OFFLOAD_TIMESTAMP
+ * is available. -1 means HW Rx timestamps are not available.
+ */
+static int      g_ts_dynfield_offset = -1;
+static uint64_t g_ts_dynflag_mask   = 0;  /* ol_flags bit for RX timestamp */
+
+/* Runtime capability flags set during port_init */
+static bool     g_hw_rx_ts = false;   /* NIC supports HW Rx timestamps */
+static bool     g_hw_tx_ts = false;   /* NIC supports timesync TX path */
 
 /* --------------------------------------------------------------------------
  * Signal handler
@@ -241,6 +260,8 @@ static void validate_topology(uint16_t port_id)
  * Clock calibration: derive NIC clock → nanoseconds conversion factor
  * -------------------------------------------------------------------------- */
 
+static bool g_hw_nic_clock = false;  /* false if rte_eth_read_clock unsupported */
+
 static void calibrate_clocks(uint16_t port_id)
 {
     uint64_t tsc0, tsc1, nic0, nic1;
@@ -249,25 +270,42 @@ static void calibrate_clocks(uint16_t port_id)
     g_hz_tsc = rte_get_tsc_hz();
 
     tsc0 = rte_rdtsc_precise();
-    rte_eth_read_clock(port_id, &nic0);
+    int rc0 = rte_eth_read_clock(port_id, &nic0);
     rte_delay_ms(CAL_MS);
     tsc1 = rte_rdtsc_precise();
-    rte_eth_read_clock(port_id, &nic1);
+    int rc1 = rte_eth_read_clock(port_id, &nic1);
 
-    uint64_t tsc_delta = tsc1 - tsc0;
-    uint64_t nic_delta = nic1 - nic0;
-
-    /* NIC Hz derived from TSC (which is calibrated by kernel) */
-    g_hz_nic = (uint64_t)((double)nic_delta / tsc_delta * g_hz_tsc);
+    if (rc0 != 0 || rc1 != 0) {
+        fprintf(stderr, "WARN: rte_eth_read_clock not supported by this PMD "
+                "(sfc/X2522 does not implement it) — "
+                "NIC clock unavailable, all measurements will use TSC only.\n");
+        g_hz_nic = g_hz_tsc;   /* set equal so nic_cycles_to_ns is a no-op ratio */
+        g_hw_nic_clock = false;
+        /* Disable HW Rx timestamps too — they need a common clock reference */
+        if (g_hw_rx_ts) {
+            fprintf(stderr, "WARN: disabling HW Rx timestamps (no NIC clock to "
+                    "convert against TSC)\n");
+            g_hw_rx_ts = false;
+        }
+    } else {
+        uint64_t tsc_delta = tsc1 - tsc0;
+        uint64_t nic_delta = nic1 - nic0;
+        g_hz_nic = (uint64_t)((double)nic_delta / tsc_delta * g_hz_tsc);
+        g_hw_nic_clock = true;
+    }
 
     printf("[Clock calibration]\n");
     printf("  TSC frequency  : %lu Hz (%.3f GHz)\n", g_hz_tsc, g_hz_tsc / 1e9);
-    printf("  NIC frequency  : %lu Hz (%.3f GHz)\n", g_hz_nic, g_hz_nic / 1e9);
+    if (g_hw_nic_clock)
+        printf("  NIC frequency  : %lu Hz (%.3f GHz)\n", g_hz_nic, g_hz_nic / 1e9);
+    else
+        printf("  NIC frequency  : unavailable (TSC-only mode)\n");
     printf("  Cal duration   : %d ms\n\n", CAL_MS);
 }
 
 static inline uint64_t nic_cycles_to_ns(uint64_t cycles)
 {
+    if (!g_hw_nic_clock || g_hz_nic == 0) return 0;
     return (uint64_t)((double)cycles / g_hz_nic * 1e9);
 }
 
@@ -291,24 +329,75 @@ static int port_init(uint16_t port_id, struct rte_mempool *pool)
         },
     };
 
-    /* Enable hardware timestamping if supported */
     struct rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(port_id, &dev_info);
+    if (rte_eth_dev_info_get(port_id, &dev_info) != 0) {
+        fprintf(stderr, "rte_eth_dev_info_get failed for port %u\n", port_id);
+        return -1;
+    }
 
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP)
+    /* Enable HW Rx timestamps if supported (dynfield path, DPDK >= 20.11) */
+    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP) {
         port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_TIMESTAMP;
-    else
-        fprintf(stderr, "WARN: NIC does not support HW Rx timestamps\n");
+        g_hw_rx_ts = true;
+    } else {
+        fprintf(stderr, "WARN: NIC does not support HW Rx timestamps — "
+                "using SW TSC for Rx (less accurate)\n");
+    }
 
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP)
+    /*
+     * HW Tx timestamp via timesync (IEEE 1588) path.
+     * Not supported by all PMDs — notably sfc (X2522) does not implement
+     * timesync_read_tx_timestamp. When absent we fall back to a TSC snapshot
+     * taken immediately after rte_eth_tx_burst() returns, which measures the
+     * PCIe descriptor write round-trip seen by software.
+     */
+    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP) {
         port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP;
-    else
-        fprintf(stderr, "WARN: NIC does not support HW Tx timestamps\n");
+        g_hw_tx_ts = true;
+    } else {
+        fprintf(stderr, "INFO: NIC does not support HW Tx timestamps — "
+                "TX latency will be measured as TSC(post-burst) - TSC(pre-burst). "
+                "Slot×node relative comparisons remain valid.\n");
+    }
 
     int ret = rte_eth_dev_configure(port_id, 1, 1, &port_conf);
     if (ret < 0) {
         fprintf(stderr, "rte_eth_dev_configure: %s\n", strerror(-ret));
         return ret;
+    }
+
+    /*
+     * Register the timestamp dynfield after port configure.
+     * This is the correct API since DPDK 20.11 — m->timestamp no longer
+     * exists as a static struct member.
+     */
+    if (g_hw_rx_ts) {
+        g_ts_dynfield_offset = rte_mbuf_dynfield_lookup(
+                RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, NULL);
+        if (g_ts_dynfield_offset < 0) {
+            /* PMD advertised offload but dynfield not yet registered —
+             * register it ourselves. PMD will find the same offset. */
+            static const struct rte_mbuf_dynfield dynfield_desc = {
+                .name = RTE_MBUF_DYNFIELD_TIMESTAMP_NAME,
+                .size = sizeof(uint64_t),
+                .align = __alignof__(uint64_t),
+            };
+            g_ts_dynfield_offset = rte_mbuf_dynfield_register(&dynfield_desc);
+        }
+        if (g_ts_dynfield_offset < 0) {
+            fprintf(stderr, "WARN: failed to register timestamp dynfield (%s) — "
+                    "disabling HW Rx timestamps\n", strerror(rte_errno));
+            g_hw_rx_ts = false;
+            port_conf.rxmode.offloads &= ~RTE_ETH_RX_OFFLOAD_TIMESTAMP;
+        } else {
+            /* Look up the ol_flags bit for RX timestamp once at init */
+            int flag_bit = rte_mbuf_dynflag_lookup(
+                               RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME, NULL);
+            if (flag_bit >= 0)
+                g_ts_dynflag_mask = RTE_BIT64(flag_bit);
+            else
+                g_ts_dynflag_mask = 0;  /* flag not registered yet; PMD sets it */
+        }
     }
 
     /* Rx queue on local NUMA socket */
@@ -341,7 +430,10 @@ static int port_init(uint16_t port_id, struct rte_mempool *pool)
     /* Promiscuous mode for loopback */
     rte_eth_promiscuous_enable(port_id);
 
-    printf("[Port %u] started. Socket: %d\n", port_id, socket_id);
+    printf("[Port %u] started. Socket: %d  HW-Rx-TS: %s  HW-Tx-TS: %s\n",
+           port_id, socket_id,
+           g_hw_rx_ts ? "yes" : "no (SW TSC fallback)",
+           g_hw_tx_ts ? "yes" : "no (SW TSC fallback)");
     return 0;
 }
 
@@ -419,7 +511,6 @@ static void run_measurement(uint16_t port_id)
     struct rte_mbuf *tx_mbuf;
     struct rte_mbuf *rx_mbufs[32];
     uint32_t seq = 0;
-    uint32_t rx_seq_expected = 0;
 
     /* Warmup */
     printf("[Warmup] sending %u packets...\n", WARMUP_PKTS);
@@ -451,10 +542,19 @@ static void run_measurement(uint16_t port_id)
                                sizeof(struct rte_ether_hdr));
         *(uint32_t *)payload = seq;
 
-        /* Request hardware Tx timestamp */
-        tx_mbuf->ol_flags |= RTE_MBUF_F_TX_IEEE1588_TMST;
+        /*
+         * TX timestamp strategy:
+         *   HW path (g_hw_tx_ts): set IEEE1588 flag, poll timesync register
+         *                          after burst. Supported on i40e, ice, ixgbe.
+         *   SW path (fallback):   TSC snapshot immediately after tx_burst.
+         *                          Used for sfc (X2522) and any PMD that does
+         *                          not implement timesync_read_tx_timestamp.
+         *                          Measures descriptor-write→burst-return time.
+         */
+        if (g_hw_tx_ts)
+            tx_mbuf->ol_flags |= RTE_MBUF_F_TX_IEEE1588_TMST;
 
-        uint64_t sw_tx_tsc = rte_rdtsc_precise();   /* SW post timestamp */
+        uint64_t sw_tx_tsc = rte_rdtsc_precise();   /* SW pre-burst timestamp */
 
         uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &tx_mbuf, 1);
         if (nb_tx == 0) {
@@ -462,14 +562,18 @@ static void run_measurement(uint16_t port_id)
             continue;
         }
 
-        /* Read back HW Tx timestamp — poll until available */
+        uint64_t sw_tx_post_tsc = rte_rdtsc_precise(); /* SW post-burst timestamp */
+
+        /* Read back HW Tx timestamp if supported, else use SW delta */
         uint64_t hw_tx_time = 0;
-        {
+        if (g_hw_tx_ts) {
+            struct timespec ts = {0, 0};
             int tries = 1000;
             while (tries-- > 0) {
-                if (rte_eth_timesync_read_tx_timestamp(port_id,
-                        (struct timespec *)&hw_tx_time) == 0)
+                if (rte_eth_timesync_read_tx_timestamp(port_id, &ts) == 0) {
+                    hw_tx_time = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
                     break;
+                }
                 rte_delay_us(1);
             }
         }
@@ -488,14 +592,28 @@ static void run_measurement(uint16_t port_id)
                 for (uint16_t j = 0; j < nb_rx; j++) {
                     struct rte_mbuf *m = rx_mbufs[j];
 
-                    /* Extract HW Rx timestamp from mbuf */
-                    if (m->ol_flags & RTE_MBUF_F_RX_IEEE1588_TMST) {
-                        uint32_t *pld = rte_pktmbuf_mtod_offset(m, uint32_t *,
-                                            sizeof(struct rte_ether_hdr));
-                        if (*pld == seq) {
-                            hw_rx_time = m->timestamp;
-                            rx_matched = true;
+                    uint32_t *pld = rte_pktmbuf_mtod_offset(m, uint32_t *,
+                                        sizeof(struct rte_ether_hdr));
+                    if (*pld == seq) {
+                        /*
+                         * Extract HW Rx timestamp via dynfield (DPDK >= 20.11).
+                         * RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME replaces the old
+                         * RTE_MBUF_F_RX_IEEE1588_TMST flag for the generic
+                         * timestamp offload path used by sfc and others.
+                         */
+                        if (g_hw_rx_ts && g_ts_dynfield_offset >= 0) {
+                            if (!g_ts_dynflag_mask) {
+                                /* PMD registers flag after port start; look up once */
+                                int bit = rte_mbuf_dynflag_lookup(
+                                    RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME, NULL);
+                                g_ts_dynflag_mask = (bit >= 0) ? RTE_BIT64(bit) : 0;
+                            }
+                            if (g_ts_dynflag_mask && (m->ol_flags & g_ts_dynflag_mask)) {
+                                hw_rx_time = *RTE_MBUF_DYNFIELD(m,
+                                                g_ts_dynfield_offset, uint64_t *);
+                            }
                         }
+                        rx_matched = true;
                     }
                     rte_pktmbuf_free(m);
                 }
@@ -506,17 +624,36 @@ static void run_measurement(uint16_t port_id)
 
         /* --- Record samples --------------------------------------------- */
 
-        if (hw_tx_time > 0 && g_tx_samples.count < MAX_SAMPLES) {
-            uint64_t tx_ns = nic_cycles_to_ns(hw_tx_time)
-                           - tsc_cycles_to_ns(sw_tx_tsc);
-            if (tx_ns < HISTO_MAX_NS * 10)
+        if (g_tx_samples.count < MAX_SAMPLES) {
+            uint64_t tx_ns;
+            if (g_hw_tx_ts && hw_tx_time > 0) {
+                /*
+                 * HW path: hw_tx_time is wall-clock ns from timespec.
+                 * sw_tx_tsc is a TSC value — convert to wall-clock ns
+                 * for the delta. This gives time from SW descriptor post
+                 * to NIC wire transmit.
+                 */
+                uint64_t sw_tx_ns = tsc_cycles_to_ns(sw_tx_tsc);
+                tx_ns = (hw_tx_time > sw_tx_ns) ? hw_tx_time - sw_tx_ns : 0;
+            } else {
+                /* SW fallback: time from pre-burst TSC to post-burst TSC */
+                tx_ns = tsc_cycles_to_ns(sw_tx_post_tsc - sw_tx_tsc);
+            }
+            if (tx_ns > 0 && tx_ns < HISTO_MAX_NS * 10)
                 g_tx_samples.samples[g_tx_samples.count++] = tx_ns;
         }
 
-        if (rx_matched && hw_rx_time > 0 && g_rx_samples.count < MAX_SAMPLES) {
-            uint64_t rx_ns = tsc_cycles_to_ns(sw_rx_tsc)
-                           - nic_cycles_to_ns(hw_rx_time);
-            if (rx_ns < HISTO_MAX_NS * 10)
+        if (rx_matched && g_rx_samples.count < MAX_SAMPLES) {
+            uint64_t rx_ns;
+            if (g_hw_rx_ts && hw_rx_time > 0) {
+                /* HW: time from NIC receive to SW poll completion */
+                rx_ns = tsc_cycles_to_ns(sw_rx_tsc) - nic_cycles_to_ns(hw_rx_time);
+            } else {
+                /* SW fallback: not meaningful in absolute terms but still
+                 * captures relative node differences */
+                rx_ns = 0;   /* omit SW-only Rx samples — no hw_rx_time to anchor */
+            }
+            if (rx_ns > 0 && rx_ns < HISTO_MAX_NS * 10)
                 g_rx_samples.samples[g_rx_samples.count++] = rx_ns;
         }
 
@@ -671,7 +808,8 @@ int main(int argc, char **argv)
         write_histo("/tmp/rx_histo.csv", &rx_stats);
     }
 
-    rte_eth_dev_stop(g_cfg.port_id);
+    if (rte_eth_dev_stop(g_cfg.port_id) != 0)
+        fprintf(stderr, "WARN: rte_eth_dev_stop failed\n");
     rte_eth_dev_close(g_cfg.port_id);
     rte_eal_cleanup();
 

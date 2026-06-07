@@ -84,19 +84,23 @@ typedef struct {
 static volatile bool g_running = true;
 
 static struct {
-    uint16_t port_id;
+    uint16_t port_id;           /* TX port (always used) */
+    uint16_t rx_port_id;        /* RX port (two-port mode: .0 TX, .1 RX) */
+    bool     two_port;          /* true when -q is supplied */
     uint32_t n_samples;
     uint32_t burst;
-    bool     loopback;          /* external loopback cable fitted */
-    bool     oneway_tx;         /* measure Tx only (no loopback) */
+    bool     loopback;          /* single-port external loopback cable */
+    bool     oneway_tx;         /* measure Tx only */
     bool     oneway_rx;         /* measure Rx only */
     int      snc_node;          /* expected NUMA/SNC node for validation */
 } g_cfg = {
-    .port_id   = 0,
-    .n_samples = DEFAULT_SAMPLES,
-    .burst     = DEFAULT_BURST,
-    .loopback  = true,
-    .snc_node  = -1,
+    .port_id    = 0,
+    .rx_port_id = 1,
+    .two_port   = false,
+    .n_samples  = DEFAULT_SAMPLES,
+    .burst      = DEFAULT_BURST,
+    .loopback   = true,
+    .snc_node   = -1,
 };
 
 static struct rte_mempool *g_pktmbuf_pool;
@@ -201,16 +205,23 @@ static int amd_detect_nps(void)
     return -1;
 }
 
-static void validate_topology(uint16_t port_id)
+static void validate_topology(uint16_t tx_port_id, uint16_t rx_port_id)
 {
-    int nic_node  = rte_eth_dev_socket_id(port_id);
+    int nic_node  = rte_eth_dev_socket_id(tx_port_id);
     int core_node = rte_socket_id();
     char vendor   = detect_cpu_vendor();
 
     printf("\n[Topology]\n");
     printf("  CPU vendor     : %s\n",
            vendor == 'A' ? "AMD" : vendor == 'I' ? "Intel" : "Unknown");
-    printf("  NIC NUMA node  : %d\n", nic_node);
+    if (g_cfg.two_port) {
+        printf("  TX port        : %u (NUMA node %d)\n",
+               tx_port_id, rte_eth_dev_socket_id(tx_port_id));
+        printf("  RX port        : %u (NUMA node %d)\n",
+               rx_port_id, rte_eth_dev_socket_id(rx_port_id));
+    } else {
+        printf("  NIC NUMA node  : %d\n", nic_node);
+    }
     printf("  Core NUMA node : %d\n", core_node);
 
     /* AMD-specific: report NPS mode and IOD quadrant locality context */
@@ -318,15 +329,23 @@ static inline uint64_t tsc_cycles_to_ns(uint64_t cycles)
  * Port initialisation
  * -------------------------------------------------------------------------- */
 
-static int port_init(uint16_t port_id, struct rte_mempool *pool)
+/*
+ * port_init - configure a DPDK port.
+ *
+ * do_tx / do_rx control which directions are enabled:
+ *   Single-port loopback / TX-only:  do_tx=true,  do_rx=true or false
+ *   Two-port TX port (.0):           do_tx=true,  do_rx=false
+ *   Two-port RX port (.1):           do_tx=false, do_rx=true
+ *
+ * Keeping directions separate avoids advertising offloads the sfc PMD
+ * does not support on a given port direction.
+ */
+static int port_init(uint16_t port_id, struct rte_mempool *pool,
+                     bool do_tx, bool do_rx)
 {
     struct rte_eth_conf port_conf = {
-        .rxmode = {
-            .mq_mode = RTE_ETH_MQ_RX_NONE,
-        },
-        .txmode = {
-            .mq_mode = RTE_ETH_MQ_TX_NONE,
-        },
+        .rxmode = { .mq_mode = RTE_ETH_MQ_RX_NONE },
+        .txmode = { .mq_mode = RTE_ETH_MQ_TX_NONE },
     };
 
     struct rte_eth_dev_info dev_info;
@@ -335,105 +354,103 @@ static int port_init(uint16_t port_id, struct rte_mempool *pool)
         return -1;
     }
 
-    /* Enable HW Rx timestamps if supported (dynfield path, DPDK >= 20.11) */
-    if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP) {
-        port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_TIMESTAMP;
-        g_hw_rx_ts = true;
-    } else {
-        fprintf(stderr, "WARN: NIC does not support HW Rx timestamps — "
-                "using SW TSC for Rx (less accurate)\n");
+    /* HW Rx timestamps — RX port only */
+    if (do_rx) {
+        if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP) {
+            port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_TIMESTAMP;
+            g_hw_rx_ts = true;
+        } else {
+            fprintf(stderr, "WARN: port %u does not support HW Rx timestamps — "
+                    "using SW TSC for Rx\n", port_id);
+        }
     }
 
     /*
-     * HW Tx timestamp via timesync (IEEE 1588) path.
-     * Not supported by all PMDs — notably sfc (X2522) does not implement
-     * timesync_read_tx_timestamp. When absent we fall back to a TSC snapshot
-     * taken immediately after rte_eth_tx_burst() returns, which measures the
-     * PCIe descriptor write round-trip seen by software.
+     * HW Tx timestamps — TX port only.
+     * sfc (X2522) does not implement timesync_read_tx_timestamp so this
+     * will not be set; TSC fallback is used automatically.
      */
-    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP) {
-        port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP;
-        g_hw_tx_ts = true;
-    } else {
-        fprintf(stderr, "INFO: NIC does not support HW Tx timestamps — "
-                "TX latency will be measured as TSC(post-burst) - TSC(pre-burst). "
-                "Slot×node relative comparisons remain valid.\n");
+    if (do_tx) {
+        if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP) {
+            port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP;
+            g_hw_tx_ts = true;
+        } else {
+            fprintf(stderr, "INFO: port %u does not support HW Tx timestamps — "
+                    "TX latency = TSC(post-burst) - TSC(pre-burst)\n", port_id);
+        }
     }
 
     int ret = rte_eth_dev_configure(port_id, 1, 1, &port_conf);
     if (ret < 0) {
-        fprintf(stderr, "rte_eth_dev_configure: %s\n", strerror(-ret));
+        fprintf(stderr, "rte_eth_dev_configure port %u: %s\n",
+                port_id, strerror(-ret));
         return ret;
     }
 
     /*
-     * Register the timestamp dynfield after port configure.
-     * This is the correct API since DPDK 20.11 — m->timestamp no longer
-     * exists as a static struct member.
+     * Register timestamp dynfield after port configure (DPDK >= 20.11).
+     * Only needed on the RX port.
      */
-    if (g_hw_rx_ts) {
+    if (do_rx && g_hw_rx_ts) {
         g_ts_dynfield_offset = rte_mbuf_dynfield_lookup(
                 RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, NULL);
         if (g_ts_dynfield_offset < 0) {
-            /* PMD advertised offload but dynfield not yet registered —
-             * register it ourselves. PMD will find the same offset. */
             static const struct rte_mbuf_dynfield dynfield_desc = {
-                .name = RTE_MBUF_DYNFIELD_TIMESTAMP_NAME,
-                .size = sizeof(uint64_t),
+                .name  = RTE_MBUF_DYNFIELD_TIMESTAMP_NAME,
+                .size  = sizeof(uint64_t),
                 .align = __alignof__(uint64_t),
             };
             g_ts_dynfield_offset = rte_mbuf_dynfield_register(&dynfield_desc);
         }
         if (g_ts_dynfield_offset < 0) {
-            fprintf(stderr, "WARN: failed to register timestamp dynfield (%s) — "
-                    "disabling HW Rx timestamps\n", strerror(rte_errno));
+            fprintf(stderr, "WARN: failed to register timestamp dynfield — "
+                    "disabling HW Rx timestamps\n");
             g_hw_rx_ts = false;
             port_conf.rxmode.offloads &= ~RTE_ETH_RX_OFFLOAD_TIMESTAMP;
         } else {
-            /* Look up the ol_flags bit for RX timestamp once at init */
             int flag_bit = rte_mbuf_dynflag_lookup(
                                RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME, NULL);
-            if (flag_bit >= 0)
-                g_ts_dynflag_mask = RTE_BIT64(flag_bit);
-            else
-                g_ts_dynflag_mask = 0;  /* flag not registered yet; PMD sets it */
+            g_ts_dynflag_mask = (flag_bit >= 0) ? RTE_BIT64(flag_bit) : 0;
         }
     }
 
-    /* Rx queue on local NUMA socket */
     int socket_id = rte_eth_dev_socket_id(port_id);
+
+    /* Rx queue */
     struct rte_eth_rxconf rxconf = dev_info.default_rxconf;
     rxconf.offloads = port_conf.rxmode.offloads;
-
     ret = rte_eth_rx_queue_setup(port_id, 0, NUM_RX_DESC, socket_id, &rxconf, pool);
     if (ret < 0) {
-        fprintf(stderr, "rte_eth_rx_queue_setup: %s\n", strerror(-ret));
+        fprintf(stderr, "rte_eth_rx_queue_setup port %u: %s\n",
+                port_id, strerror(-ret));
         return ret;
     }
 
     /* Tx queue */
     struct rte_eth_txconf txconf = dev_info.default_txconf;
     txconf.offloads = port_conf.txmode.offloads;
-
     ret = rte_eth_tx_queue_setup(port_id, 0, NUM_TX_DESC, socket_id, &txconf);
     if (ret < 0) {
-        fprintf(stderr, "rte_eth_tx_queue_setup: %s\n", strerror(-ret));
+        fprintf(stderr, "rte_eth_tx_queue_setup port %u: %s\n",
+                port_id, strerror(-ret));
         return ret;
     }
 
     ret = rte_eth_dev_start(port_id);
     if (ret < 0) {
-        fprintf(stderr, "rte_eth_dev_start: %s\n", strerror(-ret));
+        fprintf(stderr, "rte_eth_dev_start port %u: %s\n",
+                port_id, strerror(-ret));
         return ret;
     }
 
-    /* Promiscuous mode for loopback */
     rte_eth_promiscuous_enable(port_id);
 
-    printf("[Port %u] started. Socket: %d  HW-Rx-TS: %s  HW-Tx-TS: %s\n",
+    printf("[Port %u] started. Socket: %d  TX: %s  RX: %s  HW-Rx-TS: %s  HW-Tx-TS: %s\n",
            port_id, socket_id,
-           g_hw_rx_ts ? "yes" : "no (SW TSC fallback)",
-           g_hw_tx_ts ? "yes" : "no (SW TSC fallback)");
+           do_tx ? "yes" : "no",
+           do_rx ? "yes" : "no",
+           (do_rx && g_hw_rx_ts) ? "yes" : "no",
+           (do_tx && g_hw_tx_ts) ? "yes" : "no");
     return 0;
 }
 
@@ -506,20 +523,28 @@ static void compute_stats(sample_buf_t *buf, latency_stats_t *out)
  * Main measurement loop
  * -------------------------------------------------------------------------- */
 
-static void run_measurement(uint16_t port_id)
+static void run_measurement(uint16_t tx_port, uint16_t rx_port)
 {
     struct rte_mbuf *tx_mbuf;
     struct rte_mbuf *rx_mbufs[32];
     uint32_t seq = 0;
 
+    if (g_cfg.two_port)
+        printf("[Mode] Two-port: TX on port %u, RX on port %u\n",
+               tx_port, rx_port);
+    else if (g_cfg.oneway_tx)
+        printf("[Mode] TX-only (no loopback)\n");
+    else
+        printf("[Mode] Single-port loopback\n");
+
     /* Warmup */
     printf("[Warmup] sending %u packets...\n", WARMUP_PKTS);
     for (uint32_t i = 0; i < WARMUP_PKTS && g_running; i++) {
-        tx_mbuf = build_test_pkt(g_pktmbuf_pool, port_id);
+        tx_mbuf = build_test_pkt(g_pktmbuf_pool, tx_port);
         if (!tx_mbuf) break;
-        rte_eth_tx_burst(port_id, 0, &tx_mbuf, 1);
+        rte_eth_tx_burst(tx_port, 0, &tx_mbuf, 1);
         /* drain Rx */
-        uint16_t nb = rte_eth_rx_burst(port_id, 0, rx_mbufs, 32);
+        uint16_t nb = rte_eth_rx_burst(rx_port, 0, rx_mbufs, 32);
         for (uint16_t j = 0; j < nb; j++)
             rte_pktmbuf_free(rx_mbufs[j]);
         rte_delay_us(10);
@@ -531,7 +556,7 @@ static void run_measurement(uint16_t port_id)
     while (seq < g_cfg.n_samples && g_running) {
 
         /* --- TX path ---------------------------------------------------- */
-        tx_mbuf = build_test_pkt(g_pktmbuf_pool, port_id);
+        tx_mbuf = build_test_pkt(g_pktmbuf_pool, tx_port);
         if (!tx_mbuf) {
             fprintf(stderr, "mbuf alloc failed at seq %u\n", seq);
             break;
@@ -556,7 +581,7 @@ static void run_measurement(uint16_t port_id)
 
         uint64_t sw_tx_tsc = rte_rdtsc_precise();   /* SW pre-burst timestamp */
 
-        uint16_t nb_tx = rte_eth_tx_burst(port_id, 0, &tx_mbuf, 1);
+        uint16_t nb_tx = rte_eth_tx_burst(tx_port, 0, &tx_mbuf, 1);
         if (nb_tx == 0) {
             rte_pktmbuf_free(tx_mbuf);
             continue;
@@ -583,10 +608,10 @@ static void run_measurement(uint16_t port_id)
         uint64_t hw_rx_time  = 0;
         bool     rx_matched  = false;
 
-        if (g_cfg.loopback) {
+        if (g_cfg.loopback || g_cfg.two_port) {
             int rx_tries = 10000;
             while (rx_tries-- > 0 && !rx_matched) {
-                uint16_t nb_rx = rte_eth_rx_burst(port_id, 0, rx_mbufs, 32);
+                uint16_t nb_rx = rte_eth_rx_burst(rx_port, 0, rx_mbufs, 32);
                 sw_rx_tsc = rte_rdtsc_precise();
 
                 for (uint16_t j = 0; j < nb_rx; j++) {
@@ -712,33 +737,47 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [EAL options] -- "
-        "[-p PORT] [-n SAMPLES] [-s SNC_NODE] [-l] [-T] [-R]\n"
-        "  -p PORT      DPDK port ID (default 0)\n"
+        "[-p TX_PORT] [-q RX_PORT] [-n SAMPLES] [-s SNC_NODE] [-T] [-R]\n"
+        "  -p TX_PORT   DPDK TX port ID (default 0)\n"
+        "  -q RX_PORT   DPDK RX port ID for two-port mode (e.g. -p 0 -q 1)\n"
+        "               When -q is given, TX and RX use separate ports.\n"
+        "               Without -q, single-port loopback mode is used.\n"
         "  -n SAMPLES   number of packets (default %d)\n"
-        "  -s SNC_NODE  expected SNC NUMA node (for validation)\n"
-        "  -l           loopback mode (default on)\n"
-        "  -T           Tx-only (no Rx measurement)\n"
-        "  -R           Rx-only (no Tx measurement)\n",
+        "  -s SNC_NODE  expected SNC/NPS NUMA node (for validation)\n"
+        "  -T           TX-only (no Rx measurement, no loopback needed)\n"
+        "  -R           RX-only (no Tx measurement)\n",
         prog, DEFAULT_SAMPLES);
 }
 
 static int parse_args(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "p:n:s:lTRh")) != -1) {
+    bool rx_port_set = false;
+    while ((opt = getopt(argc, argv, "p:q:n:s:TRh")) != -1) {
         switch (opt) {
-        case 'p': g_cfg.port_id   = (uint16_t)atoi(optarg); break;
-        case 'n': g_cfg.n_samples = (uint32_t)atoi(optarg); break;
-        case 's': g_cfg.snc_node  = atoi(optarg);           break;
-        case 'l': g_cfg.loopback  = true;                   break;
-        case 'T': g_cfg.oneway_tx = true;                   break;
-        case 'R': g_cfg.oneway_rx = true;                   break;
+        case 'p': g_cfg.port_id    = (uint16_t)atoi(optarg); break;
+        case 'q': g_cfg.rx_port_id = (uint16_t)atoi(optarg);
+                  rx_port_set = true;                         break;
+        case 'n': g_cfg.n_samples  = (uint32_t)atoi(optarg); break;
+        case 's': g_cfg.snc_node   = atoi(optarg);           break;
+        case 'T': g_cfg.oneway_tx  = true;                   break;
+        case 'R': g_cfg.oneway_rx  = true;                   break;
         case 'h': usage(argv[0]); return -1;
         default:  usage(argv[0]); return -1;
         }
     }
-    if (g_cfg.oneway_tx || g_cfg.oneway_rx)
+    if (rx_port_set) {
+        g_cfg.two_port = true;
         g_cfg.loopback = false;
+    }
+    if (g_cfg.oneway_tx || g_cfg.oneway_rx) {
+        g_cfg.loopback  = false;
+        g_cfg.two_port  = false;
+    }
+    if (g_cfg.two_port && g_cfg.port_id == g_cfg.rx_port_id) {
+        fprintf(stderr, "ERROR: TX port and RX port must be different\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -778,16 +817,33 @@ int main(int argc, char **argv)
 
     printf("[Mempool] allocated on socket %d\n", local_socket);
 
-    if (port_init(g_cfg.port_id, g_pktmbuf_pool) < 0)
-        rte_exit(EXIT_FAILURE, "port_init failed\n");
+    /*
+     * Port initialisation.
+     * Two-port mode:    TX port gets do_tx=true/do_rx=false,
+     *                   RX port gets do_tx=false/do_rx=true.
+     * Single-port:      one port handles both directions.
+     */
+    if (g_cfg.two_port) {
+        if (port_init(g_cfg.port_id,    g_pktmbuf_pool, true,  false) < 0)
+            rte_exit(EXIT_FAILURE, "port_init failed for TX port %u\n",
+                     g_cfg.port_id);
+        if (port_init(g_cfg.rx_port_id, g_pktmbuf_pool, false, true) < 0)
+            rte_exit(EXIT_FAILURE, "port_init failed for RX port %u\n",
+                     g_cfg.rx_port_id);
+    } else {
+        bool do_rx = !g_cfg.oneway_tx;
+        bool do_tx = !g_cfg.oneway_rx;
+        if (port_init(g_cfg.port_id, g_pktmbuf_pool, do_tx, do_rx) < 0)
+            rte_exit(EXIT_FAILURE, "port_init failed\n");
+    }
 
-    validate_topology(g_cfg.port_id);
+    validate_topology(g_cfg.port_id, g_cfg.rx_port_id);
     calibrate_clocks(g_cfg.port_id);
 
     memset(&g_tx_samples, 0, sizeof(g_tx_samples));
     memset(&g_rx_samples, 0, sizeof(g_rx_samples));
 
-    run_measurement(g_cfg.port_id);
+    run_measurement(g_cfg.port_id, g_cfg.rx_port_id);
 
     /* Compute and print statistics */
     latency_stats_t tx_stats = {0}, rx_stats = {0};
@@ -808,9 +864,17 @@ int main(int argc, char **argv)
         write_histo("/tmp/rx_histo.csv", &rx_stats);
     }
 
+    /* Stop and close all initialised ports */
     if (rte_eth_dev_stop(g_cfg.port_id) != 0)
-        fprintf(stderr, "WARN: rte_eth_dev_stop failed\n");
+        fprintf(stderr, "WARN: rte_eth_dev_stop failed for port %u\n",
+                g_cfg.port_id);
     rte_eth_dev_close(g_cfg.port_id);
+    if (g_cfg.two_port) {
+        if (rte_eth_dev_stop(g_cfg.rx_port_id) != 0)
+            fprintf(stderr, "WARN: rte_eth_dev_stop failed for port %u\n",
+                    g_cfg.rx_port_id);
+        rte_eth_dev_close(g_cfg.rx_port_id);
+    }
     rte_eal_cleanup();
 
     printf("\nDone.\n");

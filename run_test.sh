@@ -13,9 +13,11 @@
 #
 # Usage:
 #   ./run_test.sh [--slots "0000:81:00.0 0000:82:00.0"] [--nodes "0 1 2 3"]
-#                [--tx-only] [--rx-only]
+#                [--tx-only] [--rx-only] [--two-port]
 #
-# Use --tx-only when no loopback cable is fitted.
+# --two-port: patch cable between .0 and .1 on each card; port .0 is TX,
+#             port .1 is RX. Both ports are bound to vfio-pci automatically.
+# --tx-only:  no cable needed; measures TX descriptor latency only.
 #
 set -euo pipefail
 
@@ -36,6 +38,12 @@ NODES="${NODES:-"0 1 2 3"}"
 # Measurement mode: "" = loopback (default), "-T" = TX only, "-R" = RX only
 MEASURE_MODE=""
 
+# Two-port mode: use port .0 as TX and port .1 as RX on each card.
+# Set to "yes" when a patch cable connects the two ports of each card.
+# When enabled, both BDFs of each card are bound to vfio-pci and passed
+# to pcie_latency via -a <bdf0> -a <bdf1> with -q 1 to designate port 1 as RX.
+TWO_PORT="no"
+
 # Output
 SUMMARY="${RESULT_DIR}/summary.csv"
 
@@ -45,11 +53,12 @@ SUMMARY="${RESULT_DIR}/summary.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --slots)   SLOTS="$2";    shift 2 ;;
-        --nodes)   NODES="$2";    shift 2 ;;
-        --n)       SAMPLES="$2";  shift 2 ;;
-        --tx-only) MEASURE_MODE="-T"; shift ;;
-        --rx-only) MEASURE_MODE="-R"; shift ;;
+        --slots)     SLOTS="$2";           shift 2 ;;
+        --nodes)     NODES="$2";           shift 2 ;;
+        --n)         SAMPLES="$2";         shift 2 ;;
+        --tx-only)   MEASURE_MODE="-T";    shift ;;
+        --rx-only)   MEASURE_MODE="-R";    shift ;;
+        --two-port)  TWO_PORT="yes";       shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -170,18 +179,29 @@ main() {
             rx_csv="${out_prefix}_rx.csv"
             log_file="${out_prefix}.log"
 
+            # In two-port mode derive the RX BDF by replacing the last
+            # character of the slot address (.0 -> .1)
+            if [[ "$TWO_PORT" == "yes" ]]; then
+                rx_slot="${slot%?}1"
+                bind_slot_vfio "$rx_slot"
+                EAL_PORTS="-a $slot -a $rx_slot"
+                APP_MODE="-p 0 -q 1"
+            else
+                EAL_PORTS="-a $slot"
+                APP_MODE="-p 0 ${MEASURE_MODE}"
+            fi
+
             numactl \
                 --cpunodebind="$node" \
                 --membind="$node" \
                 "$BINARY" \
                     -l 0    \
                     ${EAL_IOVA_FLAG:+"$EAL_IOVA_FLAG"} \
-                    -a "$slot" \
+                    $EAL_PORTS \
                     -- \
-                    -p 0 \
+                    $APP_MODE \
                     -n "$SAMPLES" \
                     -s "$node" \
-                    ${MEASURE_MODE:+"$MEASURE_MODE"} \
                 2>&1 | tee "$log_file"
 
             # Move results to named location

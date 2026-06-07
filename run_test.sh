@@ -13,6 +13,9 @@
 #
 # Usage:
 #   ./run_test.sh [--slots "0000:81:00.0 0000:82:00.0"] [--nodes "0 1 2 3"]
+#                [--tx-only] [--rx-only]
+#
+# Use --tx-only when no loopback cable is fitted.
 #
 set -euo pipefail
 
@@ -30,6 +33,9 @@ SLOTS="${SLOTS:-"0000:81:00.0 0000:82:00.0"}"
 # SNC NUMA nodes to pin the test core to
 NODES="${NODES:-"0 1 2 3"}"
 
+# Measurement mode: "" = loopback (default), "-T" = TX only, "-R" = RX only
+MEASURE_MODE=""
+
 # Output
 SUMMARY="${RESULT_DIR}/summary.csv"
 
@@ -39,9 +45,11 @@ SUMMARY="${RESULT_DIR}/summary.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --slots) SLOTS="$2";   shift 2 ;;
-        --nodes) NODES="$2";   shift 2 ;;
-        --n)     SAMPLES="$2"; shift 2 ;;
+        --slots)   SLOTS="$2";    shift 2 ;;
+        --nodes)   NODES="$2";    shift 2 ;;
+        --n)       SAMPLES="$2";  shift 2 ;;
+        --tx-only) MEASURE_MODE="-T"; shift ;;
+        --rx-only) MEASURE_MODE="-R"; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -173,6 +181,7 @@ main() {
                     -p 0 \
                     -n "$SAMPLES" \
                     -s "$node" \
+                    ${MEASURE_MODE:+"$MEASURE_MODE"} \
                 2>&1 | tee "$log_file"
 
             # Move results to named location

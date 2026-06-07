@@ -36,7 +36,7 @@
 #include <rte_lcore.h>
 #include <rte_cycles.h>
 #include <rte_malloc.h>
-#include <rte_numa.h>
+//#include <rte_numa.h>
 
 
 /* --------------------------------------------------------------------------

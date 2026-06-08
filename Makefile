@@ -18,7 +18,13 @@ ifeq ($(PKG_OK),yes)
     CFLAGS  := -O2 -g -Wall -Wextra \
                $(shell pkg-config --cflags libdpdk) \
                -DALLOW_EXPERIMENTAL_API
-    LDFLAGS := $(shell pkg-config --libs libdpdk) -lm
+    # DPDK 24.11 does not produce a monolithic libdpdk.so — use --static to get
+    # the full list of individual -lrte_* flags. The PMDs (librte_net_sfc etc.)
+    # are loaded at runtime via dlopen from the pmds directory and do not need
+    # to be listed here.
+    LDFLAGS := -L$(shell pkg-config --variable=libdir libdpdk) \
+               -Wl,-rpath,$(shell pkg-config --variable=libdir libdpdk) \
+               $(shell pkg-config --libs --static libdpdk) -lm
 else
     # Fallback: traditional RTE_SDK build
     ifndef RTE_SDK

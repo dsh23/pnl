@@ -669,14 +669,25 @@ static void run_measurement(uint16_t tx_port, uint16_t rx_port)
         }
 
         if (rx_matched && g_rx_samples.count < MAX_SAMPLES) {
-            uint64_t rx_ns;
-            if (g_hw_rx_ts && hw_rx_time > 0) {
-                /* HW: time from NIC receive to SW poll completion */
+            uint64_t rx_ns = 0;
+            if (g_hw_rx_ts && hw_rx_time > 0 && g_hw_nic_clock) {
+                /*
+                 * HW path: NIC clock available.
+                 * Measures time from NIC packet receive to SW poll completion.
+                 */
                 rx_ns = tsc_cycles_to_ns(sw_rx_tsc) - nic_cycles_to_ns(hw_rx_time);
-            } else {
-                /* SW fallback: not meaningful in absolute terms but still
-                 * captures relative node differences */
-                rx_ns = 0;   /* omit SW-only Rx samples — no hw_rx_time to anchor */
+            } else if (!g_hw_nic_clock) {
+                /*
+                 * SW fallback: used when PMD does not support rte_eth_read_clock
+                 * (e.g. sfc/X2522). Measures TSC round-trip:
+                 *   sw_tx_post_tsc  — TSC immediately after tx_burst returned
+                 *   sw_rx_tsc       — TSC immediately after matching packet received
+                 * This includes NIC TX time, wire propagation, NIC RX DMA, and
+                 * SW poll latency. Absolute values are larger than the HW path
+                 * but relative slot×node comparisons remain valid.
+                 */
+                if (sw_rx_tsc > sw_tx_post_tsc)
+                    rx_ns = tsc_cycles_to_ns(sw_rx_tsc - sw_tx_post_tsc);
             }
             if (rx_ns > 0 && rx_ns < HISTO_MAX_NS * 10)
                 g_rx_samples.samples[g_rx_samples.count++] = rx_ns;
@@ -858,8 +869,13 @@ int main(int argc, char **argv)
 
     if (g_rx_samples.count > 0) {
         compute_stats(&g_rx_samples, &rx_stats);
-        print_stats("RX latency (HW receive→SW poll completion)", &rx_stats,
-                    g_rx_samples.count);
+        if (g_hw_nic_clock)
+            print_stats("RX latency (HW receive→SW poll completion)", &rx_stats,
+                        g_rx_samples.count);
+        else
+            print_stats("RX latency SW round-trip (TX burst return→RX poll, "
+                        "no NIC clock — relative comparisons valid)", &rx_stats,
+                        g_rx_samples.count);
         write_csv("/tmp/rx_samples.csv", &g_rx_samples);
         write_histo("/tmp/rx_histo.csv", &rx_stats);
     }
